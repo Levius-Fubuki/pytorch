@@ -16,6 +16,7 @@ from __future__ import annotations
 import atexit
 import copy
 import logging
+import math
 import os
 import threading
 import time
@@ -78,6 +79,39 @@ def is_enabled() -> bool:
     return is_tune_mode() or is_reuse_mode()
 
 
+def is_tunableop_gemm(choice_name: str) -> bool:
+    """Whether an extern choice is a GEMM TunableOp tunes.
+
+    Single source of truth shared by the ladder (maybe_range_pretune) and the
+    worker routing (ExternKernelCaller.benchmark): routing an op the ladder
+    never tunes would benchmark it in the worker for no coverage, and in tune
+    mode any GEMM an unrelated kernel calls internally would pollute the
+    results file. Matched by choice name string so a double import of the
+    kernel modules cannot break the match.
+    """
+    return choice_name in _TUNABLEOP_GEMM_CHOICES
+
+
+# ExternKernelChoice names the ladder and worker routing cover. _int_mm /
+# sparse semi-structured variants are not hipBLASLt-tunable.
+_TUNABLEOP_GEMM_CHOICES = frozenset(
+    OrderedSet(
+        [
+            "mm",
+            "mm_dtype",
+            "addmm",
+            "addmm_dtype",
+            "bmm",
+            "bmm_dtype",
+            "baddbmm",
+            "bias_addmm",
+            "_scaled_mm",
+            "_scaled_mm_v2",
+        ]
+    )
+)
+
+
 class BenchmarkJob:
     """One GEMM benchmark, executed in the TunableOp worker.
 
@@ -92,7 +126,9 @@ class BenchmarkJob:
         bmreq: Any,
         tuning: bool,
         nearest_match: bool = False,
+        record_borrowed: bool = False,
         dyn_dims_mask: tuple[bool, bool, bool, bool] | None = None,
+        measure: bool = True,
     ) -> None:
         self.bmreq = bmreq
         self.tuning = tuning
@@ -105,12 +141,62 @@ class BenchmarkJob:
         # snapshot_settings): the worker is a long-lived fresh process that
         # would otherwise tune with defaults.
         self.settings: dict[str, Any] = {}
+        self.record_borrowed = record_borrowed
+        # False for tune-only jobs (the ladder): the caller discards the time
+        # and only needs the tuning side effect, so skip the second benchmark
+        # and halve the worker cost per bucket.
+        self.measure = measure
         # Stamped by submit() with the submitting process's logical device.
         self.device = 0
         # Stamped by submit() with the resolved results filename (see
         # resolve_filename): the worker re-enters it via set_filename so it
         # reads and appends to the same file the parent's key names.
         self.filename = ""
+
+    def _warm_then_measure(self) -> float:
+        """Warm, then measure.
+
+        The first call is where TunableOp does its compile-time-only work, and
+        folding that into the average reports it as the kernel's cost: on a
+        3072x1894x242432 addmm it took aten from 3.5 ms to 7.45 ms and lost the
+        autotune race to a 4.71 ms triton kernel, while the solution just recorded
+        ran in 2.9 ms.
+        """
+        try:
+            measured = self.bmreq.benchmark()
+            warm_ok = True
+        except Exception:  # a failed warm must still yield a timing
+            log.warning(
+                "TunableOp warm-up failed; measuring the untuned kernel instead",
+                exc_info=True,
+            )
+            measured = None
+            warm_ok = False
+        if not self.measure:
+            # Tune-only job (the ladder discards times): the warm already
+            # performed the tuning side effect; skip the second benchmark.
+            # A failed warm re-raises instead of reporting inf: the exception
+            # crosses the pipe and submit() restarts the worker, since a warm
+            # failure may leave a sticky fault (e.g. an illegal address)
+            # behind. Reporting inf would skip that restart and leave the
+            # poisoned worker serving every later bucket.
+            if measured is None:
+                raise RuntimeError("TunableOp tune-only warm-up failed")
+            return measured
+        # Nearest match is deliberately left on after a successful warm: if the
+        # warm call recorded nothing, turning it off would measure the default
+        # instead of the borrowed solution. After a FAILED warm, nothing was
+        # cached, so turn it off -- otherwise the timed call runs the
+        # validation inside the measurement, folding exactly the
+        # compile-time-only cost this split exists to exclude.
+        torch.cuda.tunable.tuning_enable(False)
+        if not warm_ok:
+            torch.cuda.tunable._nearest_match_enable(False)
+            log.warning(
+                "TunableOp warm-up failed and no borrow was validated; "
+                "measuring the default kernel instead"
+            )
+        return self.bmreq.benchmark()
 
     def __call__(self) -> float:
         tunable = torch.cuda.tunable
@@ -128,6 +214,9 @@ class BenchmarkJob:
         tunable.enable(True)
         tunable.tuning_enable(self.tuning)
         tunable._nearest_match_enable(self.nearest_match)
+        # Without this a validated borrow is thrown away: the write path is gated
+        # on it, so reuse mode would decide the same thing on every later pass.
+        tunable._record_borrowed_enable(self.record_borrowed)
         # Re-enter the parent's tuning knobs (snapshot_settings): process-global
         # C++ state, not env vars, so the worker would otherwise silently use
         # defaults. Numerical-check tolerances have no getter and are not
@@ -141,6 +230,7 @@ class BenchmarkJob:
         # thrown away, and returns graph-replay time instead.
         self.bmreq.benchmark_with_cudagraphs = False
         self.bmreq.config_cudagraph_benchmarking = False
+
         # The mask lives on a thread-local stack in whichever process sets it, so
         # the caller's context manager does not reach this worker. Re-enter it here
         # or every GEMM benchmarked through the worker registers only its concrete
@@ -152,8 +242,8 @@ class BenchmarkJob:
                 with tunable.dynamic_dims_mask(
                     M=mask[0], N=mask[1], K=mask[2], BATCH=mask[3]
                 ):
-                    return self.bmreq.benchmark()
-            return self.bmreq.benchmark()
+                    return self._warm_then_measure()
+            return self._warm_then_measure()
         finally:
             # The worker outlives this job -- it is torn down only on a key
             # change or at exit -- so without this it sits idle holding every
@@ -456,7 +546,7 @@ def submit(job: BenchmarkJob, timeout: float | None = None) -> Outcome:
             worker = _get_worker_locked((device, job.filename))
             try:
                 worker.put(job)
-                return Outcome(worker.get(timeout=timeout), "ok")
+                value = worker.get(timeout=timeout)
             except (TimeoutError, EOFError) as e:
                 # running is cleared only by a real pipe fault; a job that
                 # itself raises TimeoutError leaves it set and must be filed as
@@ -482,6 +572,12 @@ def submit(job: BenchmarkJob, timeout: float | None = None) -> Outcome:
     except Exception as e:  # lock/restart machinery itself failed
         log.debug("TunableOp worker machinery failed: %s", e)
         return Outcome(None, "error")
+    # inf is what a benchmark returns when it declines to run the op, and
+    # select_algorithm drops an inf candidate silently rather than reporting it.
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        log.warning("TunableOp benchmark returned %r; treating as a fault", value)
+        return Outcome(None, "error")
+    return Outcome(float(value), "ok")
 
 
 # Per-process record of laddered GEMMs: (kernel name, traced input/output meta
@@ -578,7 +674,7 @@ def maybe_range_pretune(winner) -> None:
     # op-name allowlist missed; _int_mm / sparse variants are not
     # hipBLASLt-tunable.
     choice_name = winner.choice.name
-    if choice_name not in _TUNABLEOP_GEMM_CHOICES:
+    if not is_tunableop_gemm(choice_name):
         return
     if getattr(winner, "bmreq", None) is None:
         return
@@ -939,7 +1035,9 @@ def maybe_range_pretune(winner) -> None:
         # out, and be killed again -- a flat 5s produced 334 timeouts and 334
         # kills where the shared budget produced 7. Letting the first bucket
         # have the budget absorbs the cold start instead of fighting it.
-        outcome = submit(BenchmarkJob(bmreq, tuning=True), timeout=remaining)
+        outcome = submit(
+            BenchmarkJob(bmreq, tuning=True, measure=False), timeout=remaining
+        )
         if config.cuda.aten_tunableop_pretune_debug:
             # Per-bucket cost, which nothing else records: only failures are
             # logged today, so the cost of the buckets that SUCCEED -- and
