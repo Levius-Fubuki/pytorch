@@ -760,6 +760,53 @@ class BenchmarkRequest:
             self.cleanup_run_fn()
 
 
+class _TestTunableOpJob:
+    """Supports unit testing. Runs a TunableOp BenchmarkJob with torch.cuda stubbed.
+
+    Defined here, not in the test file, for the same reason as
+    _TestBenchmarkRequest: the TuningProcess child has only torch on its path.
+    Stubbing matters because the job drives real TunableOp entry points --
+    set_device, the enable flags, the snapshotted setters -- and those need a
+    GPU, which the generic worker tests do not have. Without this the real job
+    only ever crosses the pipe on ROCm.
+    """
+
+    def __init__(self, job: Any, record_path: str | None = None) -> None:
+        self.job = job
+        self.record_path = record_path
+        # submit() stamps these onto the object it is handed and reads them back,
+        # so the wrapper carries them and __call__ copies them onto the job.
+        self.device = 0
+        self.filename = ""
+        self.settings: dict[str, Any] = {}
+
+    @property
+    def bmreq(self) -> Any:
+        # submit() inspects the job's request to pick the device; the wrapper
+        # has to look like the job it stands in for.
+        return self.job.bmreq
+
+    def __call__(self) -> float:
+        import json
+        from unittest import mock
+
+        self.job.device = self.device
+        self.job.filename = self.filename
+        self.job.settings = self.settings
+        tunable = mock.MagicMock()
+        with (
+            mock.patch("torch.cuda.set_device"),
+            mock.patch("torch.cuda.tunable", tunable),
+            mock.patch("torch.cuda.empty_cache"),
+        ):
+            result = self.job()
+        if self.record_path is not None:
+            calls = [[n, list(a), k] for n, a, k in tunable.mock_calls]
+            with open(self.record_path, "w") as f:
+                json.dump(calls, f, default=repr)
+        return result
+
+
 class _TestBenchmarkRequest(BenchmarkRequest):
     """
     Supports unit testing. Defined in this file instead of the test file so the
@@ -797,6 +844,28 @@ class _TestBenchmarkRequest(BenchmarkRequest):
         if self.crash:
             sys.exit(1)
         return self.result
+
+
+class _TestTunableMatmulRequest(_TestBenchmarkRequest):
+    """Runs a real small matmul so the child's TunableOp manager tunes/records.
+
+    Defined here (not the test file) so the TuningProcess child can unpickle
+    it. Lets a ROCm-gated test submit a real BenchmarkJob through a real
+    worker and assert on the results file both processes share.
+    """
+
+    def benchmark(
+        self, *input_tensors: torch.Tensor, out: torch.Tensor | None = None
+    ) -> float:
+        a = torch.randn(64, 64, device="cuda")
+        b = torch.randn(64, 64, device="cuda")
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        # Result deliberately unused: the point is that the op runs, so the
+        # child's TunableOp manager tunes and records it.
+        torch.matmul(a, b)
+        torch.cuda.synchronize()
+        return (time.perf_counter() - start) * 1000.0
 
 
 class _TestEnvBenchmarkRequest:
